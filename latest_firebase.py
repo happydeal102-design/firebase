@@ -45,6 +45,16 @@ credentials = service_account.Credentials.from_service_account_file(
 )
 authed_session = AuthorizedSession(credentials)
 
+# 🔥 REQUIRED Firebase Admin initialization
+from firebase_admin import credentials as fb_credentials
+
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(
+        fb_credentials.Certificate(SERVICE_ACCOUNT_FILE),
+        {
+            "projectId": PROJECT_ID
+        }
+    )
 # =============================================================================
 # HELPERS
 # =============================================================================
