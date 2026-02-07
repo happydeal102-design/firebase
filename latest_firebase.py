@@ -20,9 +20,9 @@ from google.auth.transport.requests import AuthorizedSession, Request
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-PROJECT_ID = os.environ["FIREBASE_PROJECT_ID"]
-API_KEY = os.environ["FIREBASE_API_KEY"]
-SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+PROJECT_ID = os.environ["PROJECT_ID"]
+API_KEY = os.environ["API_KEY"]
+SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
 
 KILL_SWITCH = os.getenv("KILL_SWITCH", "0")
 
