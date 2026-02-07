@@ -1,0 +1,49 @@
+name: Firebase Tenant Automation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "scripts/**"
+  workflow_dispatch:
+    inputs:
+      tenants:
+        description: "Number of tenants to ensure"
+        required: true
+        default: "101"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Firebase service account
+        run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > serviceAccountKey.json
+
+      - name: Run Firebase script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          API_KEY: ${{ secrets.API_KEY }}
+          SERVICE_ACCOUNT_FILE: serviceAccountKey.json
+          OF_ID: 15
+          MAX_WORKERS: 5
+        run: |
+          echo "${{ github.event.inputs.tenants }}" | python latest_firebase.py
