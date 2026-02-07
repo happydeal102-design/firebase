@@ -1,210 +1,198 @@
 import os
+import sys
 import time
 import secrets
 import string
-import requests
-import random
-from typing import List
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import firebase_admin
-from firebase_admin import tenant_mgt
+from firebase_admin import credentials, tenant_mgt
+import requests
 from supabase import create_client
-
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession, Request
 
-# =============================================================================
-# CONFIG FROM ENV
-# =============================================================================
+# =========================
+# CONFIG (ENV / SECRETS)
+# =========================
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-PROJECT_ID = os.environ["PROJECT_ID"]
-API_KEY = os.environ["API_KEY"]
+PROJECT_ID = os.environ["FIREBASE_PROJECT_ID"]
+API_KEY = os.environ["FIREBASE_API_KEY"]
+SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
 
-SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "serviceAccountKey.json")
+KILL_SWITCH = os.getenv("KILL_SWITCH", "0")
 
-OF_ID = int(os.environ.get("OF_ID", 15))
-PAGE_SIZE = 100
-RETRY_DELAY = 2
+EMAILS_PER_TENANT = int(os.getenv("EMAILS_PER_TENANT", "3000"))
+MAX_TENANT_WORKERS = int(os.getenv("MAX_TENANT_WORKERS", "5"))
+SLEEP_BETWEEN_ROUNDS = int(os.getenv("SLEEP_BETWEEN_ROUNDS", "10"))
 
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 5))
+OF_ID = int(os.getenv("OFFER_ID", "15"))
 
-TENANT_API_BASE = f"https://identitytoolkit.googleapis.com/v2/projects/{PROJECT_ID}/tenants"
+SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
-# =============================================================================
-# INIT CLIENTS
-# =============================================================================
+# =========================
+# INIT
+# =========================
+
+cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
+firebase_admin.initialize_app(cred)
+
+sa_creds = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_JSON, scopes=SCOPES
+)
+authed_session = AuthorizedSession(sa_creds)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=["https://www.googleapis.com/auth/cloud-platform"]
-)
-authed_session = AuthorizedSession(credentials)
+TENANTS_URL = f"https://identitytoolkit.googleapis.com/v2/projects/{PROJECT_ID}/tenants"
 
-# 🔥 REQUIRED Firebase Admin initialization
-from firebase_admin import credentials as fb_credentials
+lock = threading.Lock()
 
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(
-        fb_credentials.Certificate(SERVICE_ACCOUNT_FILE),
-        {
-            "projectId": PROJECT_ID
-        }
-    )
-# =============================================================================
+# =========================
 # HELPERS
-# =============================================================================
+# =========================
 
-def random_alpha(length: int = 7) -> str:
-    return ''.join(secrets.choice(string.ascii_letters) for _ in range(length))
+def random_alpha(n=7):
+    return "".join(secrets.choice(string.ascii_letters) for _ in range(n))
 
-def refresh_access_token() -> str:
-    credentials.refresh(Request())
-    return credentials.token
 
-# =============================================================================
-# SUPABASE
-# =============================================================================
+def get_email_from_supabase():
+    try:
+        r = supabase.rpc(
+            "get_one_email_and_insert",
+            {"p_table": "gmx_tenant_users", "p_offer_id": OF_ID}
+        ).execute()
 
-def get_email() -> str:
-    """Fetch one email from Supabase (retry until success)."""
-    while True:
-        try:
-            res = supabase.rpc(
-                "get_one_email_and_insert",
-                {"p_table": "gmx_tenant_users", "p_offer_id": OF_ID}
-            ).execute()
-            return res.data[0]["email"]
-        except Exception as e:
-            print("Supabase retry:", e)
-            time.sleep(RETRY_DELAY)
+        return r.data[0]["email"] if r.data and r.data[0]["email"] else None
+    except Exception as e:
+        print("Supabase error:", e)
+        return None
 
-def ensure_project_row() -> int:
-    res = supabase.table("fb_projects").select("*").eq("project_id", PROJECT_ID).execute()
-    if res.data:
-        return res.data[0]["id"]
 
-    insert = supabase.table("fb_projects").insert({
-        "name": PROJECT_ID,
-        "project_id": PROJECT_ID
-    }).execute()
-
-    return insert.data[0]["id"]
-
-# =============================================================================
-# TENANTS
-# =============================================================================
-
-def get_project_tenants() -> List[dict]:
-    tenants = []
-    page_token = None
-    while True:
-        url = f"{TENANT_API_BASE}?pageSize={PAGE_SIZE}"
-        if page_token:
-            url += f"&pageToken={page_token}"
-
-        res = authed_session.get(url).json()
-        tenants.extend(res.get("tenants", []))
-        page_token = res.get("nextPageToken")
-        if not page_token:
-            break
-    return tenants
-
-def create_tenant(display_name: str) -> str:
-    payload = {
-        "displayName": display_name,
-        "allowPasswordSignup": True,
-        "enableEmailLinkSignin": False
-    }
-    res = authed_session.post(TENANT_API_BASE, json=payload).json()
-    return res["name"].split("/")[-1]
-
-def update_tenant_inheritance(tenant_id: str):
-    token = refresh_access_token()
-    url = f"{TENANT_API_BASE}/{tenant_id}"
-    params = {"updateMask": "inheritance.emailSendingConfig"}
-    payload = {"inheritance": {"emailSendingConfig": True}}
-
-    res = requests.patch(
-        url, params=params, json=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    )
-
-    if res.status_code != 200:
-        print(f"[FAIL] Inheritance update {tenant_id}: {res.text}")
-
-# =============================================================================
-# USERS
-# =============================================================================
-
-def send_password_reset(email: str, tenant_id: str):
+def send_tenant_password_reset(email, tenant_id):
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={API_KEY}"
-    payload = {"requestType": "PASSWORD_RESET", "email": email, "tenantId": tenant_id}
-    res = requests.post(url, json=payload)
-    if res.status_code != 200:
-        print(f"[FAIL] Reset email {email}: {res.text}")
+    payload = {
+        "requestType": "PASSWORD_RESET",
+        "email": email,
+        "tenantId": tenant_id
+    }
 
-def add_user_and_send_reset(tenant_id: str):
-    email = get_email()
-    password = random_alpha(7) + random_alpha(7)
+    r = requests.post(url, json=payload)
+    if r.status_code != 200:
+        raise Exception(r.text)
+
+
+def add_user_and_send_reset(tenant_id, email):
     tenant_client = tenant_mgt.auth_for_tenant(tenant_id)
+
     try:
         tenant_client.create_user(
             email=email,
-            password=password,
-            display_name=f"{random_alpha()} {random_alpha()}",
-            email_verified=False
+            password=random_alpha(14),
+            email_verified=False,
+            display_name=f"{random_alpha()} {random_alpha()}"
         )
-    except Exception as e:
-        print(f"[WARN] User create failed ({email}): {e}")
-    send_password_reset(email, tenant_id)
-    time.sleep(random.uniform(0.2, 0.6))  # jitter
+    except Exception:
+        pass  # user may already exist
 
-# =============================================================================
-# MULTI-THREADING
-# =============================================================================
+    send_tenant_password_reset(email, tenant_id)
 
-def process_tenant(tenant: dict):
+
+# =========================
+# TENANT WORKER
+# =========================
+
+def process_tenant_batch(tenant: dict):
     tenant_id = tenant["name"].split("/")[-1]
-    try:
-        add_user_and_send_reset(tenant_id)
-        return tenant_id, "ok"
-    except Exception as e:
-        return tenant_id, f"error: {e}"
+    sent = 0
 
-# =============================================================================
-# MAIN
-# =============================================================================
+    print(f"🚀 Tenant {tenant_id} started")
 
-def main():
-    supa_project_id = ensure_project_row()
-    tenants = get_project_tenants()
-    print("Existing tenants:", len(tenants))
+    while sent < EMAILS_PER_TENANT:
+        if KILL_SWITCH == "1":
+            print("🛑 Kill switch enabled")
+            sys.exit(0)
 
-    target = int(os.environ.get("TENANTS_TO_CREATE", input("Enter number of tenants for this project: ")))
-    to_create = max(0, target - len(tenants))
+        email = get_email_from_supabase()
+        if not email:
+            time.sleep(2)
+            continue
 
-    for _ in range(to_create):
-        tenant_id = create_tenant(random_alpha())
-        supabase.table("fb_tenant").insert({"tenant_id": tenant_id, "fb_project_id": supa_project_id}).execute()
-        update_tenant_inheritance(tenant_id)
-        time.sleep(0.2)
+        try:
+            add_user_and_send_reset(tenant_id, email)
+            sent += 1
 
-    tenants = get_project_tenants()
-    print("Total tenants:", len(tenants))
-    print("🚀 Starting multi-threaded user creation...")
+            if sent % 100 == 0:
+                print(f"📧 {tenant_id}: {sent}/{EMAILS_PER_TENANT}")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_tenant, t) for t in tenants]
-        for future in as_completed(futures):
-            tenant_id, status = future.result()
-            print(f"[{tenant_id}] {status}")
+            time.sleep(0.05)  # rate safety
 
-    print("✅ Done")
+        except Exception as e:
+            print(f"❌ {tenant_id}: {e}")
+            time.sleep(1)
+
+    print(f"✅ Tenant {tenant_id} finished batch")
+
+
+# =========================
+# TENANT FETCH
+# =========================
+
+def get_all_tenants():
+    tenants = []
+    page_token = None
+
+    while True:
+        url = f"{TENANTS_URL}?pageSize=100"
+        if page_token:
+            url += f"&pageToken={page_token}"
+
+        r = authed_session.get(url).json()
+        tenants.extend(r.get("tenants", []))
+        page_token = r.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    return tenants
+
+
+# =========================
+# RUNNER
+# =========================
+
+def run_round(tenants):
+    with ThreadPoolExecutor(max_workers=MAX_TENANT_WORKERS) as executor:
+        futures = [
+            executor.submit(process_tenant_batch, t)
+            for t in tenants
+        ]
+
+        for f in as_completed(futures):
+            f.result()
+
+
+def infinite_runner():
+    round_num = 1
+
+    while True:
+        print(f"\n🔥 ROUND {round_num} START")
+        tenants = get_all_tenants()
+
+        run_round(tenants)
+
+        round_num += 1
+        print(f"😴 Sleeping {SLEEP_BETWEEN_ROUNDS}s")
+        time.sleep(SLEEP_BETWEEN_ROUNDS)
+
+
+# =========================
+# ENTRY
+# =========================
 
 if __name__ == "__main__":
-    main()
+    infinite_runner()
