@@ -23,7 +23,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PROJECT_ID = os.environ["PROJECT_ID"]
 API_KEY = os.environ["API_KEY"]
 #SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
-SERVICE_ACCOUNT_FILE = os.environ.get(
+SERVICE_ACCOUNT_JSON = os.environ.get(
     "SERVICE_ACCOUNT_JSON",
     "serviceAccountKey.json"
 )
