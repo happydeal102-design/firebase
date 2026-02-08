@@ -26,14 +26,15 @@ MAX_TENANT_WORKERS = int(os.getenv("MAX_TENANT_WORKERS", 5))
 SLEEP_EMPTY_QUEUE = 2
 OF_ID = int(os.getenv("OFFER_ID", 15))
 
-# Fixed tenants
+# Number of tenants to create if missing
+WANTED_TENANT_COUNT = int(os.getenv("WANTED_TENANT_COUNT", 20))
+TENANT_DISPLAY_PREFIX = "auto-tenant"
+
+# Fixed tenants to actually send emails with
 TENANT_IDS_RAW = os.getenv("TENANT_IDS", "")
 TENANT_IDS = [t.strip() for t in TENANT_IDS_RAW.split(",") if t.strip()]
-
 if len(TENANT_IDS) != 5:
-    raise ValueError("❌ Exactly 5 tenant IDs must be provided")
-
-TENANTS = [{"name": f"projects/{PROJECT_ID}/tenants/{tid}"} for tid in TENANT_IDS]
+    raise ValueError("❌ Exactly 5 tenant IDs must be provided for sending emails.")
 
 queue = Queue()
 
@@ -53,6 +54,8 @@ authed_session = AuthorizedSession(sa_creds)
 # SUPABASE
 # =========================
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+TENANTS_URL = f"https://identitytoolkit.googleapis.com/v2/projects/{PROJECT_ID}/tenants"
 
 # =========================
 # HELPERS
@@ -98,6 +101,51 @@ def add_user_and_send_reset(tenant_id, email):
         pass
     send_tenant_password_reset(email, tenant_id)
 
+# =========================
+# TENANT MANAGEMENT
+# =========================
+def get_all_tenants():
+    tenants, page_token = [], None
+    while True:
+        url = f"{TENANTS_URL}?pageSize=100"
+        if page_token:
+            url += f"&pageToken={page_token}"
+
+        r = authed_session.get(url).json()
+        tenants.extend(r.get("tenants", []))
+        page_token = r.get("nextPageToken")
+        if not page_token:
+            break
+    return tenants
+
+
+def ensure_tenant_count(wanted_count):
+    tenants = get_all_tenants()
+    existing_count = len(tenants)
+
+    print(f"🏢 Existing tenants: {existing_count}")
+    print(f"🎯 Wanted tenants:   {wanted_count}")
+
+    if existing_count >= wanted_count:
+        return tenants
+
+    missing = wanted_count - existing_count
+    print(f"➕ Creating {missing} tenants...")
+
+    for i in range(missing):
+        display_name = f"{TENANT_DISPLAY_PREFIX}-{existing_count + i + 1}"
+        payload = {
+            "displayName": display_name,
+            "emailSignInConfig": {"enabled": True, "passwordRequired": True}
+        }
+        r = authed_session.post(TENANTS_URL, json=payload)
+        if r.status_code not in (200, 201):
+            print(f"❌ Failed to create {display_name}: {r.text}")
+        else:
+            tenant_name = r.json()["name"].split("/")[-1]
+            print(f"✅ Created tenant {display_name} ({tenant_name})")
+
+    return get_all_tenants()
 
 # =========================
 # WORKER
@@ -119,15 +167,19 @@ def tenant_worker(tenant):
 
         queue.task_done()
 
-
 # =========================
 # MAIN
 # =========================
 def main():
-    print(f"🎯 Using tenants: {TENANT_IDS}")
+    # Ensure the desired number of tenants exist
+    ensure_tenant_count(WANTED_TENANT_COUNT)
 
-    with ThreadPoolExecutor(max_workers=len(TENANTS)) as executor:
-        for tenant in TENANTS:
+    # Only use the 5 fixed tenants to send emails
+    tenants_to_use = [{"name": f"projects/{PROJECT_ID}/tenants/{tid}"} for tid in TENANT_IDS]
+    print(f"🎯 Using tenants for sending emails: {TENANT_IDS}")
+
+    with ThreadPoolExecutor(max_workers=len(tenants_to_use)) as executor:
+        for tenant in tenants_to_use:
             executor.submit(tenant_worker, tenant)
 
         round_num = 1
