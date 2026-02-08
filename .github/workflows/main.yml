@@ -10,9 +10,14 @@ on:
   workflow_dispatch:
     inputs:
       tenant_ids:
-        description: "Comma-separated 5 Firebase tenant IDs"
+        description: "Comma-separated 5 Firebase tenant IDs to use for sending emails"
         required: true
         default: "tenant1,tenant2,tenant3,tenant4,tenant5"
+
+      wanted_tenants:
+        description: "Total number of tenants to ensure exist"
+        required: true
+        default: "20"
 
 jobs:
   run:
@@ -44,6 +49,7 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
 
           TENANT_IDS: ${{ github.event.inputs.tenant_ids }}
+          WANTED_TENANT_COUNT: ${{ github.event.inputs.wanted_tenants }}
 
           OFFER_ID: "15"
           EMAILS_PER_BATCH: "1000"
