@@ -1,15 +1,18 @@
 name: Firebase Tenant Runner
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "scripts/**"
   workflow_dispatch:
     inputs:
-      tenants:
-        description: "Number of tenants to ensure"
+      tenant_ids:
+        description: "Comma-separated 5 Firebase tenant IDs"
         required: true
-        default: "101"
-
-  schedule:
-    - cron: "*/30 * * * *"
+        default: "tenant1,tenant2,tenant3,tenant4,tenant5"
 
 jobs:
   run:
@@ -40,7 +43,7 @@ jobs:
           PROJECT_ID: ${{ secrets.PROJECT_ID }}
           API_KEY: ${{ secrets.API_KEY }}
 
-          WANTED_TENANT_COUNT: ${{ github.event.inputs.tenants }}
+          TENANT_IDS: ${{ github.event.inputs.tenant_ids }}
 
           OFFER_ID: "15"
           EMAILS_PER_BATCH: "1000"
